@@ -2,33 +2,38 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <format>
 #include <string>
 #include <algorithm>
 #include <vector>
 #include <span>
+#include <optional>
 #include <expected>
+#include <variant>
 
 /* mygrep ****************************************/
-     constexpr std::string_view VERSION = "0.0";
+     constexpr std::string_view VERSION = "1.0";
 /*                                               */
 /*   made by Azkey                               */
 /*************************************************/
 
 /* ToDo ********************************
-    + Support stdin
     + Support RegEx
     + Support case-ignoreing
     + Add help
-    + Deal with unavailable file input
-    + Split function (in main())
+
+    ? Target structure can be replaced
+      with std::optional
+    ? May be better to stop using switch
 ****************************************/
 
 
 // Specify the type of error.
-enum class ErrorType {
-    Unexpected = 1,
-    InvalidArgs = 2,
-    IOError = 3,
+enum class ReturnType {
+    Normal,
+    Unexpected,
+    InvalidArgs,
+    IOError,
 };
 
 class Argument {
@@ -52,68 +57,19 @@ enum class OptionFlag {
     PrintVersion = 1 << 6
 };
 OptionFlag& operator|=(OptionFlag& L, OptionFlag R);
-std::expected<OptionFlag, ErrorType>
+std::expected<OptionFlag, ReturnType>
 parseLongOption(std::string_view sv_option);
-std::expected<OptionFlag, ErrorType>
+std::expected<OptionFlag, ReturnType>
 parseShortOption(std::string_view sv_option);
-std::expected<OptionFlag, ErrorType>
+std::expected<OptionFlag, ReturnType>
 parseOption(const std::vector<std::string>& optv);
 constexpr bool hasFlag(OptionFlag value, OptionFlag flag);
 
 struct Option {
     char opShort;
-    std::string opLong;
-    bool opDefault = false;
+    std::string_view opLong;
     OptionFlag opFlag;
-    std::string description;
-};
-
-Option showIndex = {
-    .opShort{'n'},
-    .opLong{"line-number"},
-    .opFlag{OptionFlag::ShowIndex},
-    .description{"print line number with output lines"}
-};
-
-Option invert = {
-    .opShort{'v'},
-    .opLong{"invert-match"},
-    .opFlag{OptionFlag::Invert},
-    .description{"select non-matching lines"}
-};
-
-Option ignoreCase = {
-    .opShort{'i'},
-    .opLong{"ignore-case"},
-    .opFlag{OptionFlag::IgnoreCase},
-    .description{"ignore case distinctions in patterns and data"}
-};
-
-Option useRegEx = {
-    .opShort{'E'},
-    .opLong{"extended-regexp"},
-    .opFlag{OptionFlag::UseRegEx},
-    .description{"PATTERNS are extended regular expressions"}
-};
-
-Option printHitNum = {
-    .opShort{'c'},
-    .opLong{"count"},
-    .opFlag{OptionFlag::PrintHitNum},
-    .description{"print only a count of selected lines per FILE"}
-};
-
-Option printHelp = {
-    .opLong{"help"},
-    .opFlag{OptionFlag::PrintHelp},
-    .description{"display this help text and exit"}
-};
-
-Option printVersion = {
-    .opShort{'V'},
-    .opLong{"version"},
-    .opFlag{OptionFlag::PrintVersion},
-    .description{"display version information and exit"}
+    std::string_view description;
 };
 
 std::vector<Option> definedOptions = {
@@ -152,8 +108,46 @@ std::vector<Option> definedOptions = {
         .opFlag{OptionFlag::PrintHelp},
         .description{"display this help text and exit"}
     },
-    printVersion
+    Option{
+        .opShort{'V'},
+        .opLong{"version"},
+        .opFlag{OptionFlag::PrintVersion},
+        .description{"display version information and exit"}
+    }
 };
+
+namespace TargetType {
+    struct Stdin {};
+    struct File { std::string name; };
+}
+
+using Target = std::variant<TargetType::Stdin, TargetType::File>;
+
+void scanStream(
+    std::optional<std::string_view> fileName,
+    std::istream& is,
+    std::string_view pattern,
+    OptionFlag op
+);
+
+std::expected<void, ReturnType>
+tryTargetScan(
+    Target& target,
+    std::string_view pattern,
+    OptionFlag op,
+    bool requireName
+);
+
+std::string formatResult(
+    std::optional<std::string_view> fileName,
+    std::optional<std::size_t> lineIndex,
+    std::string_view line
+);
+
+std::string formatResult(
+    std::optional<std::string_view> fileName,
+    std::size_t counter
+);
 
 void callHelp();
 void callVersion();
@@ -161,74 +155,54 @@ void callVersion();
 
 int main( int argc, char* argv[] ) {
 
+    ReturnType rt = ReturnType::Normal;
+
     Argument args( argc, argv );
 
-    std::expected<OptionFlag, ErrorType> op = parseOption(args.getOptions());
+    // reject unknown option
+    std::expected<OptionFlag, ReturnType> op = parseOption(args.getOptions());
     if (!op){
         return static_cast<int>(op.error());
     }
 
     if ( hasFlag(*op, OptionFlag::PrintHelp) ) {
         callHelp();
-        return 0;
+        return static_cast<int>(rt);
     }
 
     if ( hasFlag(*op, OptionFlag::PrintVersion) ) {
         callVersion();
-        return 0;
+        return static_cast<int>(rt);
     }
 
     std::vector<std::string> operands = args.getOperands();
+    if (operands.empty()) {
+        std::cout << "Pattern is required.\n";
+        return static_cast<int>(ReturnType::InvalidArgs);
+    }
     std::string_view pattern = operands[0];
-    std::span<const std::string> files = std::span{operands}.subspan(1);
+    std::vector<Target> targets;
 
-    bool existMultipleFiles = (files.size() > 1);
-
-    if ( hasFlag(*op, OptionFlag::PrintHitNum) ){
-        for (const std::string& file : files) {
-            std::ifstream ifs(file);
-            std::string line;
-            int hitCounter = 0;
-
-            while ( std::getline(ifs, line) ) {
-                if ( hasFlag(*op, OptionFlag::Invert) ^ line.contains(pattern) ) {
-                    hitCounter++;
-                }
-            }
-
-            if (existMultipleFiles) {
-                std::cout << file << ": ";
-            }
-            std::cout << hitCounter << "\n";
-        }
-
-        return 0;
-    }
-
-    for (const std::string& file : files) {
-        std::ifstream ifs(file);
-        std::string line;
-        std::size_t lineIdx = std::size_t{0};
-        
-        while ( std::getline(ifs, line) ) {
-            lineIdx++;
-
-            if ( hasFlag(*op, OptionFlag::Invert) ^ !line.contains(pattern) ) {
-                continue;
-            }
-
-            if (existMultipleFiles) {
-                std::cout << file << ": ";
-            }
-
-            if ( hasFlag(*op, OptionFlag::ShowIndex) ) {
-                std::cout << std::setw(4) << lineIdx << "| ";
-            }
-
-            std::cout << line << "\n";
-
+    if (operands.size() == 1) {
+        targets.emplace_back(TargetType::Stdin{});
+    } else {
+        auto filenames = std::span{operands}.subspan(1);
+        for ( const std::string& filename : filenames ) {
+            targets.emplace_back(TargetType::File{filename});
         }
     }
+
+    bool requireName = targets.size() > 1;
+
+    for ( Target& target : targets ) {
+        auto result = tryTargetScan(target, pattern, *op, requireName);
+        if (!result) {
+            rt = result.error();
+        }
+
+    }
+
+    return static_cast<int>(rt);
 
 }
 
@@ -277,19 +251,19 @@ constexpr bool hasFlag(OptionFlag value, OptionFlag flag) {
     return (static_cast<UT>(value) & static_cast<UT>(flag)) != 0;
 }
 
-std::expected<OptionFlag, ErrorType>
+std::expected<OptionFlag, ReturnType>
 parseOption( const std::vector<std::string>& optv ) {
     OptionFlag opRes = OptionFlag::None;
 
     for (std::string_view opt : optv) {
         if (opt == "-") {
             std::cerr << "Undefined option: " << opt << "\n";
-            return std::unexpected{ErrorType::InvalidArgs};
+            return std::unexpected{ReturnType::InvalidArgs};
         }
         
         /* parse long option */
         if (opt.starts_with("--")) {
-            std::expected<OptionFlag, ErrorType>
+            std::expected<OptionFlag, ReturnType>
             parseResult = parseLongOption(opt);
             if ( !parseResult ){
                 return std::unexpected{parseResult.error()};
@@ -300,7 +274,7 @@ parseOption( const std::vector<std::string>& optv ) {
 
         /* parse short option */
         else if (opt.starts_with('-')) {
-            std::expected<OptionFlag, ErrorType>
+            std::expected<OptionFlag, ReturnType>
             parseResult = parseShortOption(opt);
             if ( !parseResult ){
                 return std::unexpected{parseResult.error()};
@@ -313,7 +287,7 @@ parseOption( const std::vector<std::string>& optv ) {
     return opRes;
 }
 
-std::expected<OptionFlag, ErrorType>
+std::expected<OptionFlag, ReturnType>
 parseLongOption( std::string_view sv_option ){
     // Use with `if (sv_option.starts_with("--"))` state.
     assert( sv_option.starts_with("--") );
@@ -339,7 +313,7 @@ parseLongOption( std::string_view sv_option ){
     // therefore, reject options consisting of multi-chars.
     if (sv_option.size() != 1) {
         std::cerr << "Undefined option: --" << sv_option << "\n";
-        return std::unexpected{ErrorType::InvalidArgs};
+        return std::unexpected{ReturnType::InvalidArgs};
     }
 
     findIfRes = std::ranges::find_if(
@@ -353,12 +327,12 @@ parseLongOption( std::string_view sv_option ){
         return findIfRes->opFlag;
     } else {
         std::cerr << "Undefined option: --" << sv_option << "\n";
-        return std::unexpected{ErrorType::InvalidArgs};
+        return std::unexpected{ReturnType::InvalidArgs};
     }
 
 }
 
-std::expected<OptionFlag, ErrorType>
+std::expected<OptionFlag, ReturnType>
 parseShortOption( std::string_view sv_option ){
     // Use with `if (sv_option.find_first_not_of('-') == 1)` state.
     assert(sv_option.find_first_not_of('-') == 1);
@@ -380,13 +354,127 @@ parseShortOption( std::string_view sv_option ){
             opRes |= (findIfRes->opFlag);
         } else {
             std::cerr << "Undefined option: " << sv_option << "\n";
-            return std::unexpected{ErrorType::InvalidArgs};
+            return std::unexpected{ReturnType::InvalidArgs};
         }
     }
 
     return opRes;
 
 }
+
+std::expected<void, ReturnType>
+tryTargetScan(
+    Target& target,
+    std::string_view pattern,
+    OptionFlag op,
+    bool requireName
+)
+{
+    std::optional<std::string_view> shownName;
+    std::istream* ptr_is;
+
+    // streamize target
+    std::ifstream ifs;
+    switch (target.index()) {
+        case 0/*Stdin*/:{
+            ptr_is = &std::cin;
+            break;
+        }
+
+        case 1/*File*/:{
+            std::string& fileName = std::get<1>(target).name;
+            ifs = std::ifstream(fileName);
+            if (!ifs.is_open()) {
+                std::cerr << "Invalid file name: " << fileName << "\n";
+                return std::unexpected(ReturnType::IOError);
+            }
+            if (requireName) {
+                shownName = fileName;
+            }
+            ptr_is = &ifs;
+            break;
+        }
+    }
+    scanStream(shownName, *ptr_is, pattern, op);
+
+    return {};
+
+};
+
+void scanStream(
+    std::optional<std::string_view> fileName,
+    std::istream& is,
+    std::string_view pattern,
+    OptionFlag op
+)
+{
+    std::size_t hitCounter = 0;
+    std::optional<std::size_t> lineIndex;
+    std::string line;
+    bool matched;
+
+    if( hasFlag(op, OptionFlag::ShowIndex) ) {
+        lineIndex = 0;
+    }
+
+    while( std::getline(is, line) ) {
+        if( lineIndex ) {
+            lineIndex.value()++;
+        }
+
+        matched = hasFlag(op, OptionFlag::Invert) ^ line.contains(pattern);
+        if( !matched ){
+            continue;
+        }
+
+        if( hasFlag(op, OptionFlag::PrintHitNum) ){
+            hitCounter++;
+            continue;
+        }
+        std::cout << formatResult(fileName, lineIndex, line) << "\n";
+        
+    }
+
+    if( hasFlag(op, OptionFlag::PrintHitNum) ){
+        std::cout << formatResult(fileName, hitCounter) << "\n";
+    }
+
+    return;
+};
+
+std::string formatResult(
+    std::optional<std::string_view> fileName,
+    std::optional<std::size_t> lineIndex,
+    std::string_view line
+)
+{
+    std::string resultString;
+
+    if( fileName ) {
+        resultString += std::format("{}: ", *fileName);
+    }
+    if( lineIndex ) {
+        resultString += std::format("{:>4}| ", *lineIndex);
+    }
+    resultString += line;
+
+    return resultString;
+};
+
+std::string formatResult(
+    std::optional<std::string_view> fileName,
+    std::size_t counter
+)
+{
+    std::string resultString;
+
+    if( fileName ) {
+        resultString += std::format("{}: ", *fileName);
+    }
+    resultString += std::to_string(counter);
+
+    return resultString;
+};
 
 void callHelp() {
 
