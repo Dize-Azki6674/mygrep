@@ -10,21 +10,21 @@
 #include <optional>
 #include <expected>
 #include <variant>
+#include <concepts>
+#include <type_traits>
 
 /* mygrep ****************************************/
-     constexpr std::string_view VERSION = "1.0";
+     constexpr std::string_view VERSION = "2.0";
 /*                                               */
 /*   made by Azkey                               */
 /*************************************************/
 
 /* ToDo ********************************
     + Support RegEx
-    + Support case-ignoreing
     + Add help
 
     ? Target structure can be replaced
       with std::optional
-    ? May be better to stop using switch
 ****************************************/
 
 
@@ -116,12 +116,20 @@ std::vector<Option> definedOptions = {
     }
 };
 
-namespace TargetType {
-    struct Stdin {};
-    struct File { std::string name; };
-}
+struct Stdin {};
+struct File { std::string name; };
 
-using Target = std::variant<TargetType::Stdin, TargetType::File>;
+using Target = std::variant<Stdin, File>;
+
+struct ScanVisitor {
+    std::string_view pattern;
+    OptionFlag op;
+    bool doPrintName;
+
+    std::expected<void, ReturnType> operator()( Stdin s );
+    std::expected<void, ReturnType> operator()( File  f );
+};
+
 
 void scanStream(
     std::optional<std::string_view> fileName,
@@ -130,21 +138,13 @@ void scanStream(
     OptionFlag op
 );
 
-std::expected<void, ReturnType>
-tryTargetScan(
-    Target& target,
-    std::string_view pattern,
-    OptionFlag op,
-    bool requireName
-);
-
-std::string formatResult(
+void printResult(
     std::optional<std::string_view> fileName,
-    std::optional<std::size_t> lineIndex,
+    std::size_t lineIndex,
     std::string_view line
 );
 
-std::string formatResult(
+void printResult(
     std::optional<std::string_view> fileName,
     std::size_t counter
 );
@@ -184,18 +184,20 @@ int main( int argc, char* argv[] ) {
     std::vector<Target> targets;
 
     if (operands.size() == 1) {
-        targets.emplace_back(TargetType::Stdin{});
+        targets.emplace_back(Stdin{});
     } else {
         auto filenames = std::span{operands}.subspan(1);
         for ( const std::string& filename : filenames ) {
-            targets.emplace_back(TargetType::File{filename});
+            targets.emplace_back(File{filename});
         }
     }
 
     bool requireName = targets.size() > 1;
 
     for ( Target& target : targets ) {
-        auto result = tryTargetScan(target, pattern, *op, requireName);
+        std::expected<void, ReturnType> result = std::visit(
+            ScanVisitor{ pattern, *op, requireName }, target
+        );
         if (!result) {
             rt = result.error();
         }
@@ -362,43 +364,28 @@ parseShortOption( std::string_view sv_option ){
 
 }
 
-std::expected<void, ReturnType>
-tryTargetScan(
-    Target& target,
-    std::string_view pattern,
-    OptionFlag op,
-    bool requireName
+std::expected<void, ReturnType> ScanVisitor::operator()(
+    Stdin s
 )
 {
-    std::optional<std::string_view> shownName;
-    std::istream* ptr_is;
-
-    // streamize target
-    std::ifstream ifs;
-    switch (target.index()) {
-        case 0/*Stdin*/:{
-            ptr_is = &std::cin;
-            break;
-        }
-
-        case 1/*File*/:{
-            std::string& fileName = std::get<1>(target).name;
-            ifs = std::ifstream(fileName);
-            if (!ifs.is_open()) {
-                std::cerr << "Invalid file name: " << fileName << "\n";
-                return std::unexpected(ReturnType::IOError);
-            }
-            if (requireName) {
-                shownName = fileName;
-            }
-            ptr_is = &ifs;
-            break;
-        }
-    }
-    scanStream(shownName, *ptr_is, pattern, op);
-
+    std::optional<std::string_view> tempName{std::nullopt};
+    scanStream(tempName, std::cin, pattern, op);
     return {};
+};
 
+std::expected<void, ReturnType> ScanVisitor::operator()(
+    File f
+)
+{
+    std::ifstream ifs(f.name);
+    if(!ifs.is_open()){
+        std::cerr << "Invalid file name: " << f.name << "\n";
+        return std::unexpected(ReturnType::IOError);
+    }
+    std::optional<std::string_view> thrownName;
+    if ( doPrintName ) { thrownName = f.name; }
+    scanStream(thrownName, ifs, pattern, op);
+    return {};
 };
 
 void scanStream(
@@ -409,20 +396,32 @@ void scanStream(
 )
 {
     std::size_t hitCounter = 0;
-    std::optional<std::size_t> lineIndex;
+    std::size_t lineIndex = 0;
     std::string line;
     bool matched;
 
-    if( hasFlag(op, OptionFlag::ShowIndex) ) {
-        lineIndex = 0;
-    }
+    bool doShowIndex = hasFlag(op, OptionFlag::ShowIndex);
+    bool doIgnoreCase = hasFlag(op, OptionFlag::IgnoreCase);
 
     while( std::getline(is, line) ) {
-        if( lineIndex ) {
-            lineIndex.value()++;
+        if( doShowIndex ) {
+            lineIndex++;
         }
 
-        matched = hasFlag(op, OptionFlag::Invert) ^ line.contains(pattern);
+        // in need, ignore case
+        auto searchResult = std::ranges::search(
+            line,
+            pattern,
+            std::equal_to{},
+            [doIgnoreCase](char c){
+                return doIgnoreCase ? std::tolower(c) : c;
+            },
+            [doIgnoreCase](char c){
+                return doIgnoreCase ? std::tolower(c) : c;
+            }
+        );
+
+        matched = !searchResult.empty() ^ hasFlag(op, OptionFlag::Invert);
         if( !matched ){
             continue;
         }
@@ -431,20 +430,20 @@ void scanStream(
             hitCounter++;
             continue;
         }
-        std::cout << formatResult(fileName, lineIndex, line) << "\n";
+        printResult(fileName, lineIndex, line);
         
     }
 
     if( hasFlag(op, OptionFlag::PrintHitNum) ){
-        std::cout << formatResult(fileName, hitCounter) << "\n";
+        printResult(fileName, hitCounter);
     }
 
     return;
 };
 
-std::string formatResult(
+void printResult(
     std::optional<std::string_view> fileName,
-    std::optional<std::size_t> lineIndex,
+    std::size_t lineIndex,
     std::string_view line
 )
 {
@@ -453,15 +452,16 @@ std::string formatResult(
     if( fileName ) {
         resultString += std::format("{}: ", *fileName);
     }
-    if( lineIndex ) {
-        resultString += std::format("{:>4}| ", *lineIndex);
+    if( lineIndex > 0 ) {
+        resultString += std::format("{:>4}| ", lineIndex);
     }
     resultString += line;
 
-    return resultString;
+    std::cout << resultString << "\n";
+    return;
 };
 
-std::string formatResult(
+void printResult(
     std::optional<std::string_view> fileName,
     std::size_t counter
 )
@@ -473,7 +473,8 @@ std::string formatResult(
     }
     resultString += std::to_string(counter);
 
-    return resultString;
+    std::cout << resultString << "\n";
+    return;
 };
 
 void callHelp() {
