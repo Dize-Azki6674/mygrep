@@ -1,7 +1,6 @@
 #include <cassert>
 #include <iostream>
 #include <fstream>
-#include <iomanip>
 #include <format>
 #include <string>
 #include <algorithm>
@@ -10,19 +9,15 @@
 #include <optional>
 #include <expected>
 #include <variant>
-#include <concepts>
-#include <type_traits>
+#include <regex>
 
 /* mygrep ****************************************/
-     constexpr std::string_view VERSION = "2.0";
+     constexpr std::string_view VERSION = "3.0";
 /*                                               */
 /*   made by Azkey                               */
 /*************************************************/
 
 /* ToDo ********************************
-    + Support RegEx
-    + Add help
-
     ? Target structure can be replaced
       with std::optional
 ****************************************/
@@ -66,7 +61,7 @@ parseOption(const std::vector<std::string>& optv);
 constexpr bool hasFlag(OptionFlag value, OptionFlag flag);
 
 struct Option {
-    char opShort;
+    std::optional<char> opShort;
     std::string_view opLong;
     OptionFlag opFlag;
     std::string_view description;
@@ -104,15 +99,15 @@ std::vector<Option> definedOptions = {
         .description{"print only a count of selected lines per FILE"}
     },
     Option{
-        .opLong{"help"},
-        .opFlag{OptionFlag::PrintHelp},
-        .description{"display this help text and exit"}
-    },
-    Option{
         .opShort{'V'},
         .opLong{"version"},
         .opFlag{OptionFlag::PrintVersion},
         .description{"display version information and exit"}
+    },
+    Option{
+        .opLong{"help"},
+        .opFlag{OptionFlag::PrintHelp},
+        .description{"display this help text and exit"}
     }
 };
 
@@ -122,26 +117,38 @@ struct File { std::string name; };
 using Target = std::variant<Stdin, File>;
 
 struct ScanVisitor {
-    std::string_view pattern;
+    const std::string& pattern;
     OptionFlag op;
     bool doPrintName;
 
-    std::expected<void, ReturnType> operator()( Stdin s );
-    std::expected<void, ReturnType> operator()( File  f );
+    std::expected<void, ReturnType> operator()( const Stdin& s );
+    std::expected<void, ReturnType> operator()( const File&  f );
 };
 
+struct Regex { std::regex key; };
+struct Plain { std::string key; };
+
+using Key = std::variant<Regex, Plain>;
+
+struct MatchVisitor {
+    const std::string& input;
+    OptionFlag op;
+    bool operator()( const Regex& re );
+    bool operator()( const Plain& pl );
+};
 
 void scanStream(
     std::optional<std::string_view> fileName,
     std::istream& is,
-    std::string_view pattern,
+    const std::string& pattern,
     OptionFlag op
 );
 
 void printResult(
     std::optional<std::string_view> fileName,
     std::size_t lineIndex,
-    std::string_view line
+    std::string_view line,
+    OptionFlag op
 );
 
 void printResult(
@@ -180,7 +187,7 @@ int main( int argc, char* argv[] ) {
         std::cout << "Pattern is required.\n";
         return static_cast<int>(ReturnType::InvalidArgs);
     }
-    std::string_view pattern = operands[0];
+    const std::string& pattern = operands[0];
     std::vector<Target> targets;
 
     if (operands.size() == 1) {
@@ -365,7 +372,7 @@ parseShortOption( std::string_view sv_option ){
 }
 
 std::expected<void, ReturnType> ScanVisitor::operator()(
-    Stdin s
+    const Stdin& s
 )
 {
     std::optional<std::string_view> tempName{std::nullopt};
@@ -374,7 +381,7 @@ std::expected<void, ReturnType> ScanVisitor::operator()(
 };
 
 std::expected<void, ReturnType> ScanVisitor::operator()(
-    File f
+    const File& f
 )
 {
     std::ifstream ifs(f.name);
@@ -388,40 +395,63 @@ std::expected<void, ReturnType> ScanVisitor::operator()(
     return {};
 };
 
+bool MatchVisitor::operator()( const Regex& re ){
+    namespace re_const = std::regex_constants;
+    bool invert = hasFlag(op, OptionFlag::Invert);
+
+    return std::regex_search(input, re.key) ^ invert;
+}
+
+bool MatchVisitor::operator()( const Plain& pl ){
+    bool icase = hasFlag(op, OptionFlag::IgnoreCase);
+    bool invert = hasFlag(op, OptionFlag::Invert);
+    auto searchResult = std::ranges::search(
+        input,
+        pl.key,
+        std::equal_to{},
+        [icase](char c){
+            unsigned char uc = static_cast<unsigned char>(c);
+            return icase ? std::tolower(uc) : c;
+        },
+        [icase](char c){
+            unsigned char uc = static_cast<unsigned char>(c);
+            return icase ? std::tolower(uc) : c;
+        }
+    );
+
+    return !searchResult.empty() ^ invert;
+}
+
 void scanStream(
     std::optional<std::string_view> fileName,
     std::istream& is,
-    std::string_view pattern,
+    const std::string& pattern,
     OptionFlag op
 )
 {
+    namespace re_const = std::regex_constants;
     std::size_t hitCounter = 0;
     std::size_t lineIndex = 0;
     std::string line;
     bool matched;
 
-    bool doShowIndex = hasFlag(op, OptionFlag::ShowIndex);
-    bool doIgnoreCase = hasFlag(op, OptionFlag::IgnoreCase);
+    Key key;
+    if( hasFlag(op, OptionFlag::UseRegEx) ){
+        auto rec = hasFlag(op, OptionFlag::IgnoreCase)
+            ? re_const::extended | re_const::icase
+            : re_const::extended;
+        key = Regex{std::regex(pattern, rec)};
+    } else {
+        key = Plain{pattern};
+    }
 
     while( std::getline(is, line) ) {
-        if( doShowIndex ) {
-            lineIndex++;
-        }
+        
+        lineIndex++;
 
-        // in need, ignore case
-        auto searchResult = std::ranges::search(
-            line,
-            pattern,
-            std::equal_to{},
-            [doIgnoreCase](char c){
-                return doIgnoreCase ? std::tolower(c) : c;
-            },
-            [doIgnoreCase](char c){
-                return doIgnoreCase ? std::tolower(c) : c;
-            }
-        );
-
-        matched = !searchResult.empty() ^ hasFlag(op, OptionFlag::Invert);
+        // process regex and invert together
+        matched = std::visit( MatchVisitor{ line, op }, key );
+        
         if( !matched ){
             continue;
         }
@@ -430,7 +460,7 @@ void scanStream(
             hitCounter++;
             continue;
         }
-        printResult(fileName, lineIndex, line);
+        printResult(fileName, lineIndex, line, op);
         
     }
 
@@ -444,20 +474,17 @@ void scanStream(
 void printResult(
     std::optional<std::string_view> fileName,
     std::size_t lineIndex,
-    std::string_view line
+    std::string_view line,
+    OptionFlag op
 )
 {
-    std::string resultString;
-
     if( fileName ) {
-        resultString += std::format("{}: ", *fileName);
+        std::cout << std::format("{}: ", *fileName);
     }
-    if( lineIndex > 0 ) {
-        resultString += std::format("{:>4}| ", lineIndex);
+    if( hasFlag(op, OptionFlag::ShowIndex) ) {
+        std::cout << std::format("{:>4}| ", lineIndex);
     }
-    resultString += line;
-
-    std::cout << resultString << "\n";
+    std::cout << line << "\n";
     return;
 };
 
@@ -478,9 +505,27 @@ void printResult(
 };
 
 void callHelp() {
-
+    std::cout
+    << "Usage: mygrep [OPTION]... PATTERN [FILE]...\n"
+    << "Search for PATTERN in each FILE.\n"
+    << "Example: grep -i 'hello world' menu.h main.c\n"
+    << "\n"
+    << "OPTIONS:\n";
+    for (const Option& defo : definedOptions){
+        std::string_view shownShort =
+            defo.opShort
+                ? std::format("-{},", *defo.opShort)
+                : "   ";
+            
+        std::cout << std::format(
+            "  {} --{:<20}{}\n",
+            shownShort,
+            defo.opLong,
+            defo.description
+        );
+    }
 };
 
 void callVersion() {
-
+    std::cout << "mygrep " << VERSION << "\n";
 };
